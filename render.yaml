@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: gv-chek-paid
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      - key: SELF_PING_ENABLED
+        value: "true"
