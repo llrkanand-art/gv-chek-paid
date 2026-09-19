@@ -1,8 +1,9 @@
 Croma Stock Signal
 
-This is a separate installable PWA. Deploy the folder to Vercel (or another host
-that supports the /api/stock serverless route), then open the HTTPS URL on your
-phone and use Install/Add to Home Screen.
+This is a separate installable PWA. It can run on Vercel or as a Node web service
+on Render. For Render, use the included render.yaml or set the build command to
+`npm install --omit=dev` and the start command to `npm start`. Open the HTTPS URL
+on your phone and use Install/Add to Home Screen.
 
 The app stores the watchlist, filters and latest results in the browser's local
 storage. The included serverless route is required because Croma's API does not
@@ -11,9 +12,13 @@ api in lowercase for Vercel; the app also falls back to API/stock for older
 deployments that used an uppercase API folder.
 
 The watch loop continues while the browser/installed app is allowed to run in
-the background. If the phone suspends the app, it immediately catches up when
-you return; guaranteed checks while the app is fully suspended require a
+the background. If the phone suspends the app, it immediately catches up when you
+return; guaranteed checks while the app is fully suspended require a
 server-side scheduler or native background service.
+
+The Render server includes a quiet `/healthz` endpoint and a 15-second self-ping
+by default. Set `SELF_PING_ENABLED=false` in Render to disable it. This keeps a
+running service awake; it does not increase Render's included usage allowance.
 
 Device access
 
