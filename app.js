@@ -1,7 +1,8 @@
 (() => {
   const MAX_PRODUCTS = 50;
-  const PARALLEL = 50;
+  const PARALLEL = 25;
   const BATCH_TIMEOUT_MS = 8000;
+  const ERROR_RETRY_DELAY_MS = 8000;
   const DEVICE_KEY = 'croma_stock_signal_device_id_v1';
   const DEVICE_COOKIE = 'croma_stock_signal_device_id_v1';
   const SETTINGS_KEY = 'croma_stock_signal_settings_v1';
@@ -25,28 +26,15 @@
       progressText.textContent = 'Ready';
       $('status').after(progressText);
     }
-    const style = document.createElement('style');
-    style.textContent = '.progress-text{margin-top:6px;color:#666;font-size:12px;line-height:1.2}.offer-list{margin-top:4px;font-size:11px;line-height:1.3;font-weight:600}.chips{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.chip{width:100%;min-width:0;justify-content:space-between;padding:7px 5px;font-size:13px;gap:2px;overflow:visible}.chip span{min-width:0;flex:0 0 auto;overflow:visible;text-overflow:clip;white-space:nowrap}.chip button{flex:0 0 auto;font-size:18px}.product-coupon{display:block;width:100%;margin-top:9px}#mute,#keepAwake{grid-column:1/-1}';
+     const style = document.createElement('style');
+     style.textContent = '.progress-text{margin-top:6px;color:#666;font-size:12px;line-height:1.2}.offer-list{margin-top:4px;font-size:11px;line-height:1.3;font-weight:600}.chips{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.chip{width:100%;min-width:0;justify-content:space-between;padding:7px 5px;font-size:13px;gap:2px;overflow:visible}.chip span{min-width:0;flex:0 0 auto;overflow:visible;text-overflow:clip;white-space:nowrap}.chip button{flex:0 0 auto;font-size:18px}.product-coupon{display:block;width:100%;margin-top:9px}';
     const productEntryRow = $('addProduct')?.closest('.entry-row');
     const coupon = $('coupon');
     if (productEntryRow && coupon) {
       coupon.classList.add('product-coupon');
       productEntryRow.after(coupon);
     }
-    const mute = $('mute');
-    if (mute && !$('keepAwake')) {
-      const button = document.createElement('button');
-      button.id = 'keepAwake';
-      button.type = 'button';
-      button.className = 'toggle';
-      button.addEventListener('click', () => {
-        state.screenKeep = !state.screenKeep;
-        if (state.screenKeep) keepScreenOn(); else releaseScreenLock();
-        updateScreenButton();
-      });
-      mute.parentElement.append(button);
-    }
-    updateScreenButton();
+     updateScreenButton();
     document.head.appendChild(style);
   }
 
@@ -271,7 +259,15 @@
 
   async function keepScreenOn() {
     if (!state.screenKeep || !('wakeLock' in navigator) || state.screenLock) return;
-    try { state.screenLock = await navigator.wakeLock.request('screen'); updateScreenButton(); } catch {}
+    try {
+      const lock = await navigator.wakeLock.request('screen');
+      lock.addEventListener('release', () => {
+        if (state.screenLock === lock) state.screenLock = null;
+        updateScreenButton();
+      });
+      state.screenLock = lock;
+      updateScreenButton();
+    } catch {}
   }
 
   function releaseScreenLock() {
@@ -283,11 +279,12 @@
 
   function startScreenRefresh() {
     clearInterval(state.screenTimer);
-    state.screenTimer = setInterval(() => {
-      if (!state.running || !state.screenKeep) return;
-      releaseScreenLock();
-      keepScreenOn();
-    }, 15 * 60 * 1000);
+     state.screenTimer = setInterval(() => {
+       if (!state.running || !state.screenKeep) return;
+       document.body.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 0, clientY: 0 }));
+       releaseScreenLock();
+       keepScreenOn();
+     }, 10 * 60 * 1000);
   }
 
   function stopScreenRefresh() {
@@ -334,7 +331,7 @@
     return Array.isArray(data.results) ? data.results : [];
   }
 
-  async function scanOnce() {
+  async function scanOnce(retryJobs = []) {
     if (!state.running) return;
     const keys = productKeys($('products').value);
     const pins = pinCodes($('pincodes').value);
@@ -345,10 +342,18 @@
     state.requestErrors = 0;
     state.lastError = '';
     const coupon = $('coupon').dataset.on === 'true';
-    const jobs = keys.map(item => spec(item)).filter(Boolean).flatMap(item => pins.map(pincode => ({
+    const allJobs = keys.map(item => spec(item)).filter(Boolean).flatMap(item => pins.map(pincode => ({
       key: item.key, productId: item.productId, pincode,
       offerCheck: !item.withoutCoupon && coupon
     })));
+    const jobs = retryJobs.length
+      ? retryJobs.filter(job => keys.includes(job.key) && pins.includes(job.pincode))
+      : allJobs;
+    const failedJobs = new Map();
+    const rememberFailedJob = job => {
+      const key = `${job.productId}:${job.pincode}:${job.offerCheck ? 'offer' : 'stock'}`;
+      failedJobs.set(key, job);
+    };
     let completed = 0;
     let hadError = false;
     let errorMessage = '';
@@ -362,6 +367,7 @@
       } catch (error) {
         if (!state.running) return;
         hadError = true;
+        if (error.retryable !== false) batch.forEach(rememberFailedJob);
         if (!error.silent) {
           state.requestErrors += 1;
           errorMessage ||= error.message;
@@ -376,7 +382,13 @@
         row.pincodes = row.pincodes.filter(pin => pin !== result.pincode);
         row.errors = (row.errors || []).filter(error => error.pincode !== result.pincode);
         if (result.available) row.pincodes.push(result.pincode);
-        if (result.error) { row.errors.push({ pincode: result.pincode, message: result.error }); hadError = true; errorMessage ||= result.error; setNetwork('error', '⚠ Croma API error'); }
+        if (result.error) {
+          rememberFailedJob(result);
+          row.errors.push({ pincode: result.pincode, message: result.error });
+          hadError = true;
+          errorMessage ||= result.error;
+          setNetwork('error', '⚠ Croma API error');
+        }
         row.available = row.pincodes.length > 0;
         state.rows.set(result.key, row);
       });
@@ -391,16 +403,18 @@
     if (visible.length && !hadError) playMario(); else stopMario();
     state.lastError = hadError ? errorMessage : '';
     render();
+    return [...failedJobs.values()];
   }
 
   async function start() {
     if (state.running) return;
     if (!state.licensed) { await checkAccess(); if (!state.licensed) return; }
     state.running = true; state.screenKeep = true; $('start').disabled = true; $('start').textContent = '▶ Checking Stock...'; $('stop').disabled = false; saveSettings(); unlockAudio(); keepScreenOn(); startScreenRefresh(); updateScreenButton();
+    let retryJobs = [];
     try {
       while (state.running) {
         try {
-          await scanOnce();
+          retryJobs = await scanOnce(retryJobs) || [];
         } catch (error) {
           if (!state.running) break;
           state.requestErrors += 1;
@@ -408,8 +422,14 @@
           renderSignals();
           stopErrorAlarm(); render();
           if (!error.retryable) { state.running = false; break; }
+          retryJobs = [];
         }
-        if (state.running) await waitForNextScan(Math.max(1, Number($('interval').value) || 1) * 1000);
+        if (state.running) {
+          const delay = retryJobs.length
+            ? ERROR_RETRY_DELAY_MS
+            : Math.max(1, Number($('interval').value) || 1) * 1000;
+          await waitForNextScan(delay);
+        }
       }
     } finally {
       clearTimeout(state.timer); state.timer = null; state.wake = null; state.running = false; state.screenKeep = false; stopScreenRefresh(); releaseScreenLock(); $('start').disabled = false; $('stop').disabled = true; updateScreenButton();
@@ -433,8 +453,6 @@
     $('status').textContent = 'Stopped. Saved results remain below.';
     $('start').disabled = false; $('start').textContent = '▶ Start checking'; $('stop').disabled = true;
   }
-  function clearResults() { stop(); stopErrorAlarm(); state.rows.clear(); try { localStorage.removeItem(RESULTS_KEY); } catch {} $('progressBar').style.width = '0'; $('status').textContent = ''; render(); }
-
   function load() {
     try {
       const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
@@ -454,8 +472,13 @@
   $('pincodeChips').addEventListener('click', event => { const button = event.target.closest('[data-remove]'); if (!button) return; $('pincodes').value = pinCodes($('pincodes').value).filter(value => value !== button.dataset.remove).join('\n'); $('pincodes').dispatchEvent(new Event('input', { bubbles:true })); });
   $('category').addEventListener('input', saveSettings); $('interval').addEventListener('change', saveSettings);
   $('coupon').addEventListener('click', () => setCoupon($('coupon').dataset.on !== 'true'));
-  $('mute').addEventListener('click', () => { state.muted = !state.muted; if (state.muted) stopErrorAlarm(); setMute(); saveSettings(); });
-  $('start').addEventListener('click', start); $('stop').addEventListener('click', stop); $('clear').addEventListener('click', clearResults);
+   $('mute').addEventListener('click', () => { state.muted = !state.muted; if (state.muted) stopErrorAlarm(); setMute(); saveSettings(); });
+   $('keepAwake').addEventListener('click', () => {
+     state.screenKeep = !state.screenKeep;
+     if (state.screenKeep) keepScreenOn(); else releaseScreenLock();
+     updateScreenButton();
+   });
+   $('start').addEventListener('click', start); $('stop').addEventListener('click', stop);
   $('copyDevice').addEventListener('click', async () => { try { await navigator.clipboard.writeText(state.deviceId); $('copyDevice').textContent = 'Copied'; setTimeout(() => { $('copyDevice').textContent = 'Copy ID'; }, 1500); } catch { $('accessMessage').textContent = 'Copy failed. Press and hold the Device ID to copy it.'; } });
   $('recheckAccess').addEventListener('click', checkAccess);
   window.addEventListener('online', () => setNetwork('online', '● Network connected'));
